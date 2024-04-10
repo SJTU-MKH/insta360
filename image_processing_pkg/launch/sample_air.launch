@@ -1,0 +1,5 @@
+
+<launch>
+    <include file="$(find jsk_perception)/sample/sample_insta360_air.launch" />
+    <node name="image_processor_node" pkg="image_processing_pkg" type="image_processor_node" />
+</launch>

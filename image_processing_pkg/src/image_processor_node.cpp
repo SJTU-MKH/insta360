@@ -1,49 +1,32 @@
-extern "C"
-{
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include <libavfilter/avfilter.h>
-#include <libavfilter/buffersink.h>
-#include <libavfilter/buffersrc.h>
-#include <libavutil/opt.h>
-}
-
 #include <ros/ros.h>
 #include <image_transport/image_transport.h>
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/image_encodings.h>
+#include <opencv2/opencv.hpp>
+#include <chrono>
+#include <fstream>
+struct PGMImage
+{
+    int width{};
+    int height{};
+    std::vector<u_int16_t> data; // 存储图像像素数据
+};
 
 class ImageProcessor
 {
 public:
     ImageProcessor(ros::NodeHandle &nh) : nh_(nh)
     {
-        // load xmap and ymap files
-        if (avformat_open_input(&xmap_format_ctx, xmap_filename, nullptr, nullptr) != 0)
-        {
-            // handle error
-            std::cerr << "Error: Could not open xmap file" << std::endl;
-        }
-
-        if (avformat_open_input(&ymap_format_ctx, ymap_filename, nullptr, nullptr) != 0)
-        {
-            // handle error
-            std::cerr << "Error: Could not open ymap file" << std::endl;
-        }
-
         image_transport::ImageTransport it(nh_);
         image_sub_ = it.subscribe("/insta360/image_raw", 1, &ImageProcessor::imageCallback, this);
+        image_pub = it.advertise("/insta360/image_get", 1);
+        xmap_in = loadPGM(xmap_filename);
+        ymap_in = loadPGM(ymap_filename);
+        _init_dstImg = false;
     }
 
     ~ImageProcessor()
     {
-        // Release FFmpeg resources
-        av_frame_free(&frame);
-        avcodec_free_context(&codecContext);
-        avformat_close_input(&formatContext);
     }
 
     void imageCallback(const sensor_msgs::ImageConstPtr &msg)
@@ -58,252 +41,154 @@ public:
             ROS_ERROR("cv_bridge exception: %s", e.what());
             return;
         }
-        // ffmpeg -i input.mp4 -i xmap.pgm -i ymap.pgm -q 0 -lavfi "format=pix_fmts=rgb24,remap" remapped.mp4
-        // ffmpeg -r 30 -i ./demopics/insta360-still-001.png -i xmap.pgm -i ymap.pgm
-        // -q 0 -lavfi "format=pix_fmts=rgb24,remap" -f image2  ./demopics/insta360_still-001_basic.jpg
+        auto start = std::chrono::high_resolution_clock::now();
+        cv::Mat srcImg = cv_ptr->image;
+        cv::resize(srcImg, srcImg, cv::Size(1024, 512));
+        cv::Mat leftImg = srcImg(cv::Rect(0, 0, srcImg.cols / 2, srcImg.rows));
+        cv::Mat rightImg = srcImg(cv::Rect(srcImg.cols / 2, 0, srcImg.cols / 2, srcImg.rows));
 
-        // Convert OpenCV Mat to AVFrame
-        // AVFrame *avFrame = cvMatToAVFrame(cv_ptr->image);
-
-        AVFormatContext *input_format_ctx = cvMatToAVFormatContext(cv_ptr->image);
-        // Process AVFrame using FFmpeg
-        // Example: You can encode the AVFrame or perform other operations
-        // Create filter graph
-        AVFilterGraph *filter_graph = avfilter_graph_alloc();
-        if (!filter_graph)
+        cv::rotate(leftImg, leftImg, cv::ROTATE_90_CLOCKWISE);
+        cv::rotate(rightImg, rightImg, cv::ROTATE_90_COUNTERCLOCKWISE);
+        
+        
+        if (_init_dstImg == false)
         {
-            // handle error
+            dstImg = cv::Mat::zeros(srcImg.size(), srcImg.type());
+            tmpImg = cv::Mat::zeros(srcImg.size(), srcImg.type());
+            _init_dstImg = true;
+            // 获取图像的宽度和高度
+            width = srcImg.cols;
+            height = srcImg.rows;
+
+            dlinesize = width * 3;
+            slinesize = width * 3;
+            xlinesize = width;
+            ylinesize = width;
+            step = 3;
+            _init_dstImg = true;
         }
+        std::cout << "srcImg size: " << srcImg.size() << std::endl
+                  << "start processing..." << std::endl;
 
-        // Create input filter for input image 1504*3008
-        AVFilterContext *input_filter_ctx = avfilter_graph_alloc_filter(filter_graph, avfilter_get_by_name("buffer"), "in");
-        // Set input filter parameters (omitted for brevity)
-        // av_opt_set_int_list(input_filter_ctx, "width", &width, 0, AV_OPT_SEARCH_CHILDREN);
-        // av_opt_set_int_list(input_filter_ctx, "height", &height, 0, AV_OPT_SEARCH_CHILDREN);
-        // av_opt_set_sample_fmt(input_filter_ctx, "pix_fmts", AV_PIX_FMT_RGB24, AV_OPT_SEARCH_CHILDREN);
+        
+        remap(srcImg, dstImg);
+        cv::flip(dstImg, dstImg, 1);
+        cv::flip(dstImg, dstImg, 0);
+        auto end = std::chrono::high_resolution_clock::now();
 
-        // Create input filter for xmap
-        AVFilterContext *xmap_filter_ctx = avfilter_graph_alloc_filter(filter_graph, avfilter_get_by_name("buffer"), "xmap");
-        // Set xmap filter parameters (omitted for brevity)
+        // 计算执行时间（以毫秒为单位）
+        std::chrono::duration<double, std::milli> duration_ms = end - start;
+        double cpu_time_used = duration_ms.count();
 
-        // Create input filter for ymap
-        AVFilterContext *ymap_filter_ctx = avfilter_graph_alloc_filter(filter_graph, avfilter_get_by_name("buffer"), "ymap");
-        // Set ymap filter parameters (omitted for brevity)
-
-        // Create output filter
-        AVFilterContext *output_filter_ctx = avfilter_graph_alloc_filter(filter_graph, avfilter_get_by_name("buffersink"), "out");
-        // Set output filter parameters (omitted for brevity)
-
-        // Add filters to the filter graph
-        // avfilter_link(input_filter_ctx, 0, xmap_filter_ctx, 0);
-        // avfilter_link(xmap_filter_ctx, 0, ymap_filter_ctx, 0);
-        // avfilter_link(ymap_filter_ctx, 0, output_filter_ctx, 0);
-
-        // Configure filter graph
-        AVFilterInOut *outputs = avfilter_inout_alloc();
-        AVFilterInOut *inputs = avfilter_inout_alloc();
-        outputs->name = av_strdup("in");
-        outputs->filter_ctx = input_filter_ctx;
-        outputs->pad_idx = 0;
-        outputs->next = nullptr;
-        inputs->name = av_strdup("out");
-        inputs->filter_ctx = output_filter_ctx;
-        inputs->pad_idx = 0;
-        inputs->next = nullptr;
-
-        if (avfilter_graph_parse_ptr(filter_graph, "format=pix_fmts=rgb24,remap", &inputs, &outputs, nullptr) < 0)
-        {
-            // handle error
-        }
-
-        if (avfilter_graph_config(filter_graph, nullptr) < 0)
-        {
-            // handle error
-        }
-
-        AVPacket packet;
-        int ret;
-        while (av_read_frame(input_format_ctx, &packet) >= 0)
-        {
-            if (packet.stream_index == 0)
-            { // Assuming video stream index is 0
-                // Decode the video packet
-                AVFrame *frame = av_frame_alloc();
-                if (!frame)
-                {
-                    // handle error
-                }
-
-                ret = avcodec_send_packet(input_filter_ctx->filter->inputs[0], &packet);
-                if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
-                {
-                    // handle error
-                }
-
-                while (ret >= 0)
-                {
-                    ret = avcodec_receive_frame(input_filter_ctx->filter->inputs[0], frame);
-                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-                    {
-                        break;
-                    }
-                    else if (ret < 0)
-                    {
-                        // handle error
-                    }
-
-                    // Convert AVFrame to cv::Mat
-                    cv::Mat img = avframe_to_cvmat(frame);
-                    cv::imshow("result", img);
-                    cv::waitKey(0)
-
-                    // Process the image using OpenCV functions (e.g., cv::imshow)
-                    av_frame_unref(frame);
-
-                }
-
-                av_frame_free(&frame);
-            }
-
-            av_packet_unref(&packet);
-        }
-
-        // Cleanup
-        avfilter_inout_free(&inputs);
-        avfilter_inout_free(&outputs);
-        avfilter_graph_free(&filter_graph);
-        avformat_close_input(&input_format_ctx);
-        avformat_close_input(&xmap_format_ctx);
-        avformat_close_input(&ymap_format_ctx);
-
-        // Release AVFrame
-        av_frame_free(&avFrame);
+        std::cout << "Code execution time: " << cpu_time_used << " ms" << std::endl;
+        cv::imshow("dst", dstImg);
+        cv::waitKey(1);
+        cv_image.image = dstImg;
+        cv_image.encoding = sensor_msgs::image_encodings::BGR8;
+        sensor_msgs::ImagePtr image_msg = cv_image.toImageMsg();
+        image_msg->header = msg->header;
+        image_pub.publish(image_msg);
     }
 
 private:
     ros::NodeHandle nh_;
     image_transport::Subscriber image_sub_;
+    // Publish dstImg on topic /insta360/image_get
+    image_transport::Publisher image_pub;
+    cv_bridge::CvImage cv_image;
 
-    AVFrame *frame = nullptr;
-    AVCodecContext *codecContext = nullptr;
-    AVFormatContext *formatContext = nullptr;
+    const char *xmap_filename = "/data/catkin_ws/src/image_processing_pkg/img/xmapfinal.pgm";
+    const char *ymap_filename = "/data/catkin_ws/src/image_processing_pkg/img/ymapfinal.pgm";
 
-    const char *xmap_filename = "/data/insta360/Insta360-Air-remap/Insta360-Air-remap/xmap.pgm";
-    const char *ymap_filename = "/data/insta360/Insta360-Air-remap/Insta360-Air-remap/ymap.pgm";
+   
 
-    // Open xmap file
-    AVFormatContext *xmap_format_ctx = nullptr;
-    // Open ymap file
-    AVFormatContext *ymap_format_ctx = nullptr;
+    cv::Mat dstImg, tmpImg;
+    int width, height, dlinesize, slinesize, xlinesize, ylinesize, step;
+    bool _init_dstImg;
+    PGMImage xmap_in, ymap_in;
 
-    AVFrame *cvMatToAVFrame(const cv::Mat &cvImage)
+    void remap(cv::Mat srcImg, cv::Mat &dstImg)
     {
-        AVFrame *avFrame = av_frame_alloc();
-        if (!avFrame)
+        uint16_t *xmap;
+        uint16_t *ymap;
+        // 0:rotate,1:map
+
+            xmap = xmap_in.data.data();
+            ymap = ymap_in.data.data();
+
+        uint8_t *dst = dstImg.data;
+        uint8_t *src = srcImg.data;
+        int c, x, y;
+        for (y = 0; y < height; y++)
         {
-            ROS_ERROR("Failed to allocate AVFrame");
-            return nullptr;
-        }
-
-        avFrame->format = AV_PIX_FMT_BGR24;
-        avFrame->width = cvImage.cols;
-        avFrame->height = cvImage.rows;
-
-        int ret = av_frame_get_buffer(avFrame, 0);
-        if (ret < 0)
-        {
-            ROS_ERROR("Failed to allocate AVFrame data");
-            av_frame_free(&avFrame);
-            return nullptr;
-        }
-
-        cv::Mat dst(cvImage.size(), CV_8UC3, avFrame->data[0], avFrame->linesize[0]);
-        cvImage.copyTo(dst);
-
-        return avFrame;
-    }
-
-    AVFormatContext *cvMatToAVFormatContext(const cv::Mat &cvImage)
-    {
-        AVFormatContext *input_format_ctx = nullptr;
-        // Convert OpenCV image to AVFrame
-        AVFrame *frame = av_frame_alloc();
-        if (!frame)
-        {
-            ROS_ERROR("Failed to allocate AVFrame");
-            return;
-        }
-
-        frame->format = AV_PIX_FMT_BGR24;
-        frame->width = image.cols;
-        frame->height = image.rows;
-
-        int ret = av_frame_get_buffer(frame, 32);
-        if (ret < 0)
-        {
-            ROS_ERROR("Failed to allocate frame data");
-            av_frame_free(&frame);
-            return;
-        }
-
-        // Copy image data to AVFrame
-        memcpy(frame->data[0], image.data, image.total() * image.elemSize());
-
-        // Open input format context if not opened yet
-        if (!input_format_ctx)
-        {
-            avformat_alloc_output_context2(&input_format_ctx, nullptr, nullptr, nullptr);
-            if (!input_format_ctx)
+            for (x = 0; x < width; x++)
             {
-                ROS_ERROR("Failed to allocate output context");
-                av_frame_free(&frame);
-                return;
+                for (c = 0; c < step; c++)
+                {
+                    if (ymap[x] < height && xmap[x] < width)
+                    {
+                        dst[x * step + c] = src[ymap[x] * slinesize + xmap[x] * step + c];
+                    }
+                    else
+                    {
+                        dst[x * step + c] = 0;
+                    }
+                }
             }
+            dst += dlinesize;
+            xmap += xlinesize;
+            ymap += ylinesize;
         }
+    };
 
-        // Add frame to input format context
-        AVStream *stream = avformat_new_stream(input_format_ctx, nullptr)
-
-            if (!stream)
+    PGMImage loadPGM(const char *filename)
+    {
+        std::ifstream file(filename);
+        if (!file.is_open())
         {
-            ROS_ERROR("Failed to create new stream");
-            av_frame_free(&frame);
-            return;
+            throw std::runtime_error("Failed to open file");
         }
 
-        // Initialize codec parameters
-        AVCodecParameters *codec_params = stream->codecpar;
-        codec_params->codec_type = AVMEDIA_TYPE_VIDEO;
-        codec_params->codec_id = AV_CODEC_ID_RAWVIDEO;
-        codec_params->format = AV_PIX_FMT_BGR24;
-        codec_params->width = frame->width;
-        codec_params->height = frame->height;
+        std::string magic;
+        std::string line;
+        int width, height, maxVal;
 
-        ret = avcodec_parameters_to_context(stream->codec, codec_params);
-        if (ret < 0)
+        // 读取PGM文件头信息
+        file >> magic;
+        if (magic != "P2")
         {
-            ROS_ERROR("Failed to initialize codec parameters");
-            av_frame_free(&frame);
-            return;
+            throw std::runtime_error("Invalid PGM file format");
         }
 
-        // Write the frame to the output context
-        ret = av_write_frame(input_format_ctx, frame);
-        if (ret < 0)
+        // 跳过注释行
+        std::getline(file, line); // Skip first line
+        std::getline(file, line); // Skip comment line
+
+        // 读取图像宽度和高度
+        file >> width >> height;
+
+        // 读取最大像素值
+        file >> maxVal;
+
+        // 读取像素数据
+        PGMImage image;
+        image.width = width;
+        image.height = height;
+        image.data.resize(width * height);
+
+        for (int i = 0; i < width * height; ++i)
         {
-            ROS_ERROR("Error writing frame to output context");
-            av_frame_free(&frame);
-            return;
+            int pixelValue;
+            file >> pixelValue;
+            image.data[i] = static_cast<u_int16_t>(pixelValue);
         }
-        return input_format_ctx;
+
+        return image;
     }
 };
 
 int main(int argc, char **argv)
 {
-    av_register_all();
-    avcodec_register_all();
-    avformat_network_init();
 
     ros::init(argc, argv, "image_processor");
     ros::NodeHandle nh;
